@@ -210,6 +210,56 @@ fleetmind/
 
 ---
 
+## What Can It Actually Do?
+
+**The Most Powerful Demo: Confidential Document Analysis**
+
+```
+Query: "Summarise this 20-page board meeting transcript, extract every 
+decision made, list action items by owner, and flag financial risks."
+
+FleetMind response (processed entirely on your devices, never left the building):
+
+DECISIONS:
+- Approved $2M marketing budget (Owner: Sarah Chen, Q4 deadline)  
+- Delayed product launch to March (Owner: Engineering team)
+- Greenlit two new enterprise partnerships (Owner: BD team)
+
+ACTION ITEMS:
+- CFO to present revised Q4 forecast by Oct 15
+- Legal to review partnership contracts within 30 days
+- HR to finalise new hire plan by end of month
+
+FINANCIAL RISKS:
+- Revenue shortfall of $400K flagged in Q3 actuals
+- Two enterprise contracts pending renewal — combined value $1.2M
+- FX exposure on EU contracts not yet hedged
+
+Processed by: Mac node (Ollama bridge) | Latency: 44s | Tokens: 6,847
+Cost: $0.00 | Data egress: 0 bytes
+```
+
+That document — your company's most sensitive material — never touched a cloud server. No OpenAI engineer can subpoena it. No data breach exposes it. No API outage delays it. This is what "private AI infrastructure" actually means.
+
+---
+
+## Why Not Just Use Ollama on Office Computers?
+
+| | Ollama on Laptops (DIY) | FleetMind on Phones |
+|---|---|---|
+| Disrupts employee work? | Yes — uses their RAM/CPU while they work | No — phones sit idle in pockets |
+| MDM deployment? | No — manual install on each machine | Yes — one push, zero-touch |
+| Fleet dashboard? | No — build it yourself | Built in |
+| Automatic mesh discovery? | No — manual config per machine | mDNS auto-discovery |
+| Battery/load awareness? | No | Yes — pauses at 20% battery |
+| Packaged enterprise product? | No — DIY with LiteLLM + scripts | Yes |
+| Hardware already owned? | Yes (laptops) | Yes (phones) |
+| Device doing other work? | Yes — employee is using it | No — phone is idle |
+
+The core insight: a laptop running Excel is not idle compute. A phone sitting in a pocket is. FleetMind harvests the dark compute nobody was using.
+
+---
+
 ## Roadmap
 
 - [ ] iOS support — waiting on Apple MDM background compute entitlements
