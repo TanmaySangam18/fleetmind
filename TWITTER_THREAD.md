@@ -1,106 +1,175 @@
-# FleetMind Launch Thread
+# FleetMind Twitter Thread — The Encryption Angle
+
+> Post as a single thread. Each section = one tweet.
+> Hook first. Proof second. CTA last.
 
 ---
 
 **Tweet 1 — Hook**
 
-Your company pays $40K/year to OpenAI while 500 employee phones sit in pockets doing nothing.
+Microsoft has a $200M team working on Confidential Computing.
 
-We built software that turns those phones into a private AI cluster that costs $0/month to run. No new hardware. No cloud. This is how we did it 🧵
+Google built shielded VMs. Apple built Private Cloud Compute. Intel built TDX. AMD built SEV.
 
----
+All of them failed to solve the same problem.
 
-**Tweet 2 — The Problem**
-
-The average 500-person company spends $3,000–$8,000/month on OpenAI API calls.
-
-Most of that is internal tooling. Summarize this doc. Draft this email. Answer this HR question.
-
-None of it needed to leave the building. You've been renting a data center for work you already own the hardware to do.
+We solved it with 3,000 lines of code and the phones already in your employees' pockets 🧵
 
 ---
 
-**Tweet 3 — The Insight**
+**Tweet 2 — The problem they can't solve**
 
-Every employee phone is a computer.
+The holy grail of enterprise AI: run a model on your data without the cloud provider seeing it.
 
-A modern Android flagship has 12–16 GB RAM and an NPU that can run a 1B parameter model at 20 tok/s. It's already on the company network. It's already paid for. It sits idle 90% of the workday.
+Every company above has a version of this. None of them actually delivers it.
 
-The data center was already there. Nobody connected it.
+Here's why:
 
----
+Their AI runs on their hardware. Your data leaves your building. It reaches their datacenter. Which means:
+- They can be subpoenaed
+- They can be breached
+- Their policy can change
 
-**Tweet 4 — How FleetMind Works**
-
-- Install the FleetMind agent on employee phones (MDM one-click deploy)
-- Phones join a private mesh over the local network — no internet required
-- Queries route to whichever device has spare capacity and battery
-
-The AI never leaves the building. You pay nothing per query. Ever.
+"Confidential" is doing a lot of heavy lifting in "Confidential Computing."
 
 ---
 
-**Tweet 5 — Architecture**
+**Tweet 3 — The real definition**
+
+True zero-egress AI means:
+
+✓ Model runs on hardware YOU own
+✓ Backend routes encrypted blobs it cannot decrypt
+✓ Private keys never touch any server — ever
+✓ Even a fully compromised backend sees noise
+
+The difference between "our policy says we don't read it" and "we literally cannot read it."
+
+Policy can change. Mathematics cannot.
+
+---
+
+**Tweet 4 — How we did it**
+
+Every Android phone ships with ARM TrustZone — a hardware-enforced security boundary the OS cannot breach. Android Keystore uses it to generate keys that NEVER leave the chip.
+
+FleetMind uses this to route AI queries:
+
+1. Each employee phone generates an EC key pair inside TrustZone
+2. Only the PUBLIC key goes to our backend
+3. Queries are encrypted with the target device's public key (ECDH + AES-256-GCM)
+4. Backend receives an opaque blob and a device ID
+5. That's all the backend ever has
+
+---
+
+**Tweet 5 — The proof**
+
+Here's what happens when you try to decrypt a finance query with an engineering phone's private key:
 
 ```
-  [Laptop] → query
-      ↓
-  [Mesh Coordinator]
-   /    |    \
-[Phone] [Phone] [Phone]
-  ↑       ↑       ↑
-  idle   idle   charging
+decrypt_query(blob, engineering_phone_private_key)
 
-Each node: Ollama bridge + llama3.2:1b
-Load balances by battery + availability
-No single point of failure
+→ cryptography.exceptions.InvalidTag
+```
+
+Not a 403.
+Not an "access denied" response.
+Not a policy check.
+
+An AES-GCM authentication tag failure. The math rejected it.
+
+You cannot override mathematics with a court order.
+
+---
+
+**Tweet 6 — Why they structurally cannot offer this**
+
+The constraint isn't technical. It's business:
+
+Microsoft, Google, and Apple cannot put their AI on YOUR hardware.
+- Their model is proprietary IP
+- Their liability requires centralized logging
+- Their SOC 2 requires audit trails
+- Their business model IS your data
+
+They are not building toward zero-egress. Zero-egress destroys their moat.
+
+FleetMind runs open-weight models (Llama, Gemma, Phi-4) on hardware your IT department already manages. There is no cloud dependency to protect.
+
+---
+
+**Tweet 7 — The mesh**
+
+```
+[CFO's laptop] → query
+       ↓ encrypted to finance-phone-1's public key
+[FleetMind backend] → sees opaque blob → routes to finance-phone-1
+       ↓ still encrypted
+[Finance phone TrustZone] → decrypts inside hardware boundary
+       ↓ runs Llama 3.2 locally
+[Response encrypted back to CFO's device]
+       ↓
+[CFO sees answer]
+
+Backend saw: 159 bytes of noise.
+Logs contain: 159 bytes of noise.
+Subpoena yields: 159 bytes of noise.
 ```
 
 ---
 
-**Tweet 6 — Why Nothing Else Does This**
+**Tweet 8 — One line of code to switch**
 
-Ollama: runs on one machine, not a fleet of phones.
+```diff
+- base_url = "https://api.openai.com/v1"
++ base_url = "http://your-company.local:8080/v1"
+```
 
-Exo: distributed inference across owned servers, requires dedicated hardware.
+Every internal tool you built on OpenAI's API works immediately.
 
-RunAnywhere: cloud offload, still leaves your network.
-
-FleetMind is the first system that treats the phones your company already issues as a unified private inference cluster.
-
----
-
-**Tweet 7 — The Numbers**
-
-500-phone fleet, 8-hour workday, 40% average idle rate:
-
-- Available compute: ~200 phones at any moment
-- Throughput: ~4,000 tok/s aggregate on llama3.2:1b
-- Cost per query: $0.00
-- vs. GPT-4o-mini at $0.15/1M tokens: $0 vs. ~$45K/year at enterprise volume
-
-The hardware was already depreciated. The inference is now free.
+Same API. Same format. Runs on your phones. Costs $0 per query. Cannot be subpoenaed.
 
 ---
 
-**Tweet 8 — Open Source**
+**Tweet 9 — Who this is for**
 
-MIT license. No telemetry. No vendor lock-in. The mesh coordinator, Android agent, and Ollama bridge are all open.
+Healthcare company with HIPAA exposure? Every ChatGPT session with patient data is a breach waiting for an OCR audit.
 
-You can audit exactly what runs on your employees' phones. You can fork it. You can self-host the management layer.
+Defense contractor? You already can't use commercial AI. Now you don't have to.
+
+Law firm? Your client privilege depends on where your AI processes your briefs.
+
+Any company that has answered "can we use AI for this?" with "legal said no."
+
+FleetMind is the yes.
+
+---
+
+**Tweet 10 — Open source**
+
+MIT license. No telemetry. No vendor lock-in.
+
+You can audit every line of code running on your employees' phones. You can fork it. You can self-host the management layer.
+
+The trust model is not "trust FleetMind." The trust model is "trust mathematics."
 
 GitHub: https://github.com/TanmaySangam18/fleetmind
 
+Star it if this matters to you. We read every issue.
+
 ---
 
-**Tweet 9 — Call to Action**
+**Tweet 11 — CTA**
 
-If your company has a line item for OpenAI, star this repo.
+The gap in the market is not "cheaper AI."
 
-We're going commercial — enterprise support, MDM integrations, compliance tooling — when we hit 50K stars. Until then, it's free, it's MIT, and it works today.
+The gap is AI your legal team will actually approve.
 
-https://github.com/TanmaySangam18/fleetmind
+FleetMind → https://github.com/TanmaySangam18/fleetmind
 
-Build the AI infrastructure you already own.
+Try it with one phone and one Mac. Takes 10 minutes. Check TESTING.md.
+
+Build the AI infrastructure that couldn't be subpoenaed even if someone wanted to.
 
 ---
