@@ -15,6 +15,10 @@
 
 Your company has been renting AI infrastructure it already owns.
 
+A modern data center requires **18 engineered systems** to operate: utility power, backup generators, UPS, PDUs, chillers, cooling towers, CRAC units, underfloor cooling, physical security, fire suppression, server racks, GPU servers, storage systems, fiber cabling, network switches, patch panels, raised floors, and 24/7 monitoring. Every time you call `api.openai.com`, you're paying for all of them.
+
+FleetMind needs three things: corporate WiFi, employee phones, and our software. You already have the first two.
+
 Every Android phone in your employee fleet has a Snapdragon or MediaTek chip capable of running a 1–3B parameter language model. FleetMind pools those chips across your corporate WiFi into a single inference mesh — then exposes a drop-in OpenAI-compatible API that your internal tools point to instead of `api.openai.com`. Nothing leaves the building.
 
 ```

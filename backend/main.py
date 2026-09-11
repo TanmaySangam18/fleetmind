@@ -17,13 +17,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from database import get_db, init_db, Company, Device, Query, Employee
+from database import get_db, init_db, Company, Device, Query, Employee, StoredFile, StorageChunk, FleetAlert, PowerEvent
 from license import generate_license_key
 from rbac import (
     ROLES, NAMESPACES, can_access, get_accessible_namespaces,
     get_eligible_nodes, generate_user_key, encrypt_query, decrypt_query,
 )
 from attestation import verify_android_attestation
+from power import power_score, is_power_eligible, get_reserve_pool, sort_by_power_score, check_power_alerts
+from thermal import thermal_score, is_thermally_eligible, fleet_thermal_health, check_thermal_alerts
+from storage import store_file, retrieve_file, delete_file, fleet_storage_stats
+from security_monitor import record_query, check_anomaly, check_attestation_alerts, check_offline_alerts
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,23 @@ class HeartbeatRequest(BaseModel):
     queries_processed: int
     uptime_seconds: int
     operator_email: Optional[str] = None
+    # Direct chunk-push address (LAN IP of the Android device)
+    device_ip: Optional[str] = None
+    # Power layer
+    battery_level: Optional[int] = None
+    is_charging: Optional[bool] = None
+    estimated_runtime_mins: Optional[int] = None
+    # Thermal layer
+    cpu_temp_celsius: Optional[float] = None
+    thermal_state: Optional[str] = None  # NONE/LIGHT/MODERATE/SEVERE/CRITICAL
+    # Network layer
+    wifi_rssi_dbm: Optional[int] = None
+    network_bandwidth_mbps: Optional[float] = None
+    # Compute
+    cpu_usage_percent: Optional[float] = None
+    ram_available_mb: Optional[int] = None
+    # Storage
+    available_storage_mb: Optional[int] = None
 
 
 class MeshQueryRequest(BaseModel):
@@ -143,7 +164,9 @@ def _generate_trial_token() -> str:
 
 
 def _resolve_company_by_license(db: Session, license_key: str) -> Company:
-    company = db.query(Company).filter(Company.license_key == license_key).first()
+    company = db.query(Company).filter(
+        (Company.license_key == license_key) | (Company.trial_token == license_key)
+    ).first()
     if not company:
         raise HTTPException(status_code=404, detail="License key not found")
     return company
@@ -320,6 +343,8 @@ def device_heartbeat(body: HeartbeatRequest, db: Session = Depends(get_db)):
         device.is_active = True
         if body.operator_email:
             device.operator_role = operator_role
+        if body.device_ip is not None:
+            device.device_ip = body.device_ip
     else:
         device = Device(
             company_id=company.id,
@@ -328,11 +353,57 @@ def device_heartbeat(body: HeartbeatRequest, db: Session = Depends(get_db)):
             queries_processed=body.queries_processed,
             is_active=True,
             operator_role=operator_role,
+            device_ip=body.device_ip,
         )
         db.add(device)
+        db.flush()  # assign device.id so alert FK is valid
+
+    # Power layer update
+    if body.battery_level is not None:
+        device.battery_level = body.battery_level
+    if body.is_charging is not None:
+        device.is_charging = body.is_charging
+    if body.estimated_runtime_mins is not None:
+        device.estimated_runtime_mins = body.estimated_runtime_mins
+    # Thermal layer update
+    if body.cpu_temp_celsius is not None:
+        device.cpu_temp_celsius = body.cpu_temp_celsius
+    if body.thermal_state is not None:
+        device.thermal_state = body.thermal_state
+    # Network layer update
+    if body.wifi_rssi_dbm is not None:
+        device.wifi_rssi_dbm = body.wifi_rssi_dbm
+    if body.network_bandwidth_mbps is not None:
+        device.network_bandwidth_mbps = body.network_bandwidth_mbps
+    # Compute layer update
+    if body.cpu_usage_percent is not None:
+        device.cpu_usage_percent = body.cpu_usage_percent
+    if body.ram_available_mb is not None:
+        device.ram_available_mb = body.ram_available_mb
+    # Storage layer update
+    if body.available_storage_mb is not None:
+        device.available_storage_mb = body.available_storage_mb
+
+    # Emit alerts for power and thermal state
+    all_alerts = []
+    all_alerts.extend(check_power_alerts(device, company.id, db))
+    all_alerts.extend(check_thermal_alerts(device, company.id))
+    for alert in all_alerts:
+        db.add(FleetAlert(
+            company_id=company.id,
+            severity=alert["severity"],
+            alert_type=alert["alert_type"],
+            device_id=alert.get("device_id"),
+            message=alert["message"],
+        ))
 
     db.commit()
-    return {"acknowledged": True, "server_time": datetime.utcnow().isoformat()}
+    return {
+        "acknowledged": True,
+        "server_time": datetime.utcnow().isoformat(),
+        "power_eligible": is_power_eligible(device),
+        "thermal_eligible": is_thermally_eligible(device),
+    }
 
 
 @app.get("/api/dashboard/{license_key}")
@@ -420,9 +491,19 @@ def mesh_query(body: MeshQueryRequest, db: Session = Depends(get_db)):
     if not active_devices:
         raise HTTPException(status_code=503, detail="No active devices in fleet")
 
+    # Power + thermal aware routing (replaces: PDU + CRAC/CRAH routing)
+    eligible = [d for d in active_devices if is_power_eligible(d) and is_thermally_eligible(d)]
+    if not eligible:
+        # Fall back to reserve pool (Generator equivalent)
+        reserve = get_reserve_pool(active_devices)
+        eligible = reserve if reserve else active_devices
+
+    # Sort by combined power+thermal score (PDU load balancing)
+    eligible = sort_by_power_score(eligible)
+
     idx = _round_robin_index.get(company.id, 0)
-    target_device = active_devices[idx % len(active_devices)]
-    _round_robin_index[company.id] = (idx + 1) % len(active_devices)
+    target_device = eligible[idx % len(eligible)]
+    _round_robin_index[company.id] = (idx + 1) % len(eligible)
 
     t_start = time.time()
     mock_response = random.choice(MOCK_RESPONSES)
@@ -437,6 +518,9 @@ def mesh_query(body: MeshQueryRequest, db: Session = Depends(get_db)):
     )
     db.add(q)
     db.commit()
+
+    # Record query for anomaly detection (Fire Suppression)
+    record_query(target_device.device_id)
 
     return {
         "response": mock_response,
@@ -743,6 +827,748 @@ def secure_mesh_query(body: SecureQueryRequest, db: Session = Depends(get_db)):
     }
 
 
+class OAIMessage(BaseModel):
+    role: str
+    content: str
+
+class OAIRequest(BaseModel):
+    model: str = "llama3.2:1b"
+    messages: list[OAIMessage]
+    stream: bool = False
+
+@app.post("/v1/chat/completions")
+def openai_chat(
+    body: OAIRequest,
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    license_key = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        license_key = authorization[7:].strip()
+    if not license_key:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <license_key> required")
+
+    company = _resolve_company_by_license(db, license_key)
+    status, _ = _license_status(company)
+    if status == "expired":
+        raise HTTPException(status_code=403, detail="License expired")
+
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active_devices = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+    ).all()
+
+    if not active_devices:
+        raise HTTPException(status_code=503, detail="No active devices in fleet")
+
+    # Power + thermal aware routing (replaces: PDU + CRAC/CRAH routing)
+    eligible = [d for d in active_devices if is_power_eligible(d) and is_thermally_eligible(d)]
+    if not eligible:
+        # Fall back to reserve pool (Generator equivalent)
+        reserve = get_reserve_pool(active_devices)
+        eligible = reserve if reserve else active_devices
+
+    # Sort by combined power+thermal score (PDU load balancing)
+    eligible = sort_by_power_score(eligible)
+
+    idx = _round_robin_index.get(company.id, 0)
+    target_device = eligible[idx % len(eligible)]
+    _round_robin_index[company.id] = (idx + 1) % len(eligible)
+
+    user_content = " ".join(m.content for m in body.messages if m.role == "user")
+    mock_response = random.choice(MOCK_RESPONSES)
+    latency_ms = random.randint(40, 200)
+
+    prompt_hash = hashlib.sha256(user_content.encode()).hexdigest()
+    q = Query(
+        company_id=company.id,
+        device_id=target_device.id,
+        prompt_hash=prompt_hash,
+        latency_ms=latency_ms,
+    )
+    db.add(q)
+    db.commit()
+
+    # Record query for anomaly detection (Fire Suppression)
+    record_query(target_device.device_id)
+
+    return {
+        "id": f"fleetmind-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "model": body.model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": mock_response},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": len(user_content.split()), "completion_tokens": len(mock_response.split()), "total_tokens": 0},
+        "x_fleetmind": {
+            "device_id": target_device.device_id,
+            "device_model": target_device.device_model,
+            "latency_ms": latency_ms,
+            "cost_usd": 0.0,
+            "egress_bytes": 0,
+        },
+    }
+
+
+# ===== POWER LAYER (Utility Grid + Generators + UPS + PDUs) =====
+
+@app.get("/api/fleet/power")
+def fleet_power(license_key: str, db: Session = Depends(get_db)):
+    """PDU dashboard: fleet-wide power status."""
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    devices = db.query(Device).filter(Device.company_id == company.id).all()
+    active = [d for d in devices if d.last_seen and d.last_seen >= cutoff]
+
+    reserve = get_reserve_pool(active)
+    eligible = [d for d in active if is_power_eligible(d)]
+
+    return {
+        "total_devices": len(devices),
+        "active_devices": len(active),
+        "power_eligible_devices": len(eligible),
+        "reserve_pool_size": len(reserve),  # Generator equivalent
+        "reserve_devices": [d.device_id for d in reserve],
+        "fleet_battery_avg": round(sum(d.battery_level or 100 for d in active) / len(active), 1) if active else None,
+        "charging_devices": sum(1 for d in active if d.is_charging),
+        "low_battery_devices": [
+            {"device_id": d.device_id, "battery_level": d.battery_level, "is_charging": d.is_charging}
+            for d in active if (d.battery_level or 100) < 30
+        ],
+        "power_scores": {d.device_id: round(power_score(d), 3) for d in active},
+    }
+
+
+@app.post("/api/device/power-event")
+def report_power_event(
+    license_key: str,
+    device_id: str,
+    event_type: str,
+    battery_level: int,
+    db: Session = Depends(get_db),
+):
+    """UPS equivalent: devices report power state transitions."""
+    company = _resolve_company_by_license(db, license_key)
+    db.add(PowerEvent(
+        company_id=company.id,
+        device_id=device_id,
+        event_type=event_type,
+        battery_level=battery_level,
+    ))
+    db.commit()
+    return {"recorded": True}
+
+
+# ===== THERMAL LAYER (Chillers + Cooling Towers + CRAC/CRAH + Underfloor) =====
+
+@app.get("/api/fleet/thermal")
+def fleet_thermal(license_key: str, db: Session = Depends(get_db)):
+    """CRAC/CRAH dashboard: fleet-wide thermal status."""
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+    ).all()
+
+    health = fleet_thermal_health(active)
+    return {
+        **health,
+        "thermal_eligible_devices": sum(1 for d in active if is_thermally_eligible(d)),
+        "device_temps": [
+            {
+                "device_id": d.device_id,
+                "cpu_temp_celsius": d.cpu_temp_celsius,
+                "thermal_state": d.thermal_state or "NONE",
+                "thermal_score": round(thermal_score(d), 3),
+                "eligible": is_thermally_eligible(d),
+            }
+            for d in active
+        ],
+    }
+
+
+# ===== STORAGE LAYER (Storage Systems: block/object/file) =====
+
+@app.post("/v1/files")
+async def upload_file(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Distributed file storage — replaces Storage Systems.
+    Chunks, encrypts, and distributes a file across the phone fleet.
+    """
+    license_key = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        license_key = authorization[7:].strip()
+    if not license_key:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <license_key> required")
+
+    company = _resolve_company_by_license(db, license_key)
+    status, _ = _license_status(company)
+    if status == "expired":
+        raise HTTPException(status_code=403, detail="License expired")
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided — use multipart/form-data with field 'file'")
+
+    data = await file.read()
+    filename = file.filename or "unnamed"
+
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active_devices = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+    ).all()
+
+    if not active_devices:
+        raise HTTPException(status_code=503, detail="No active devices — file cannot be distributed")
+
+    try:
+        result = store_file(company.id, filename, data, active_devices, db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage failed: {e}")
+
+    return result
+
+
+@app.get("/v1/files")
+def list_files(
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    license_key = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        license_key = authorization[7:].strip()
+    if not license_key:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <license_key> required")
+
+    company = _resolve_company_by_license(db, license_key)
+    files = db.query(StoredFile).filter(
+        StoredFile.company_id == company.id,
+        StoredFile.is_deleted == False,
+    ).all()
+
+    return {
+        "files": [
+            {
+                "file_id": f.file_id,
+                "filename": f.filename,
+                "size_bytes": f.total_size_bytes,
+                "chunks": f.chunk_count,
+                "replication_factor": f.replication_factor,
+                "created_at": f.created_at.isoformat(),
+            }
+            for f in files
+        ],
+        "storage_stats": fleet_storage_stats(company.id, db),
+    }
+
+
+@app.get("/v1/files/{file_id}")
+def download_file(
+    file_id: str,
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    from fastapi.responses import Response as FastAPIResponse
+    license_key = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        license_key = authorization[7:].strip()
+    if not license_key:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <license_key> required")
+
+    _resolve_company_by_license(db, license_key)
+
+    try:
+        filename, data = retrieve_file(file_id, db)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return FastAPIResponse(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete("/v1/files/{file_id}")
+def delete_stored_file(
+    file_id: str,
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    license_key = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        license_key = authorization[7:].strip()
+    if not license_key:
+        raise HTTPException(status_code=401, detail="Authorization: Bearer <license_key> required")
+
+    company = _resolve_company_by_license(db, license_key)
+    deleted = delete_file(file_id, company.id, db)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"deleted": True, "file_id": file_id}
+
+
+# ===== SECURITY LAYER (Physical Security + Fire Suppression) =====
+
+@app.get("/api/fleet/security")
+def fleet_security(license_key: str, db: Session = Depends(get_db)):
+    """Physical Security dashboard: attestation status, quarantine status, anomalies."""
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    devices = db.query(Device).filter(Device.company_id == company.id).all()
+    active_ids = [d.device_id for d in devices if d.last_seen and d.last_seen >= cutoff]
+
+    security_status = []
+    for d in devices:
+        anomaly = check_anomaly(d.device_id, active_ids)
+        security_status.append({
+            "device_id": d.device_id,
+            "hardware_attested": d.hardware_attested,
+            "is_quarantined": d.is_quarantined,
+            "quarantine_reason": d.quarantine_reason,
+            "is_online": d.last_seen is not None and d.last_seen >= cutoff,
+            "anomaly_alert": anomaly,
+        })
+
+    quarantined = [s for s in security_status if s["is_quarantined"]]
+    unattested = [s for s in security_status if not s["hardware_attested"]]
+    anomalies = [s for s in security_status if s["anomaly_alert"]]
+
+    return {
+        "total_devices": len(devices),
+        "quarantined_devices": len(quarantined),
+        "unattested_devices": len(unattested),
+        "anomalies_detected": len(anomalies),
+        "security_score": round(
+            (len(devices) - len(quarantined) - len(unattested) * 0.5) / max(len(devices), 1), 3
+        ),
+        "devices": security_status,
+    }
+
+
+@app.post("/api/device/quarantine")
+def quarantine_device(
+    license_key: str,
+    device_id: str,
+    reason: str,
+    db: Session = Depends(get_db),
+):
+    """Fire Suppression equivalent: immediately isolate a compromised device."""
+    company = _resolve_company_by_license(db, license_key)
+    device = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.device_id == device_id,
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    device.is_quarantined = True
+    device.quarantine_reason = reason
+    device.quarantined_at = datetime.utcnow()
+    device.is_active = False
+
+    db.add(FleetAlert(
+        company_id=company.id,
+        severity="critical",
+        alert_type="security",
+        device_id=device_id,
+        message=f"Device {device_id} QUARANTINED: {reason}",
+    ))
+    db.commit()
+    return {"quarantined": True, "device_id": device_id}
+
+
+@app.post("/api/device/unquarantine")
+def unquarantine_device(
+    license_key: str,
+    device_id: str,
+    db: Session = Depends(get_db),
+):
+    """Lift quarantine and restore a device to active rotation."""
+    company = _resolve_company_by_license(db, license_key)
+    device = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.device_id == device_id,
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    device.is_quarantined = False
+    device.quarantine_reason = None
+    device.quarantined_at = None
+    device.is_active = True
+    db.commit()
+    return {"unquarantined": True, "device_id": device_id}
+
+
+# ===== NETWORK LAYER (Cabling + Switches + Patch Panels + Raised Floor) =====
+
+@app.get("/api/fleet/network")
+def fleet_network(license_key: str, db: Session = Depends(get_db)):
+    """Network topology map — replaces Cabling, Switches, Patch Panels, Raised Floor."""
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    devices = db.query(Device).filter(Device.company_id == company.id).all()
+    active = [d for d in devices if d.last_seen and d.last_seen >= cutoff]
+
+    def signal_quality(rssi):
+        if rssi is None:
+            return "unknown"
+        if rssi >= -50:
+            return "excellent"
+        elif rssi >= -60:
+            return "good"
+        elif rssi >= -70:
+            return "fair"
+        return "poor"
+
+    nodes = [
+        {
+            "device_id": d.device_id,
+            "device_model": d.device_model,
+            "wifi_rssi_dbm": d.wifi_rssi_dbm,
+            "signal_quality": signal_quality(d.wifi_rssi_dbm),
+            "network_bandwidth_mbps": d.network_bandwidth_mbps,
+            "is_online": True,
+            "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+        }
+        for d in active
+    ]
+
+    rssi_vals = [d.wifi_rssi_dbm for d in active if d.wifi_rssi_dbm is not None]
+    avg_rssi = round(sum(rssi_vals) / len(rssi_vals), 1) if rssi_vals else None
+
+    bw_vals = [d.network_bandwidth_mbps for d in active if d.network_bandwidth_mbps is not None]
+    avg_bw = round(sum(bw_vals) / len(bw_vals), 1) if bw_vals else None
+
+    return {
+        "active_nodes": len(active),
+        "total_nodes": len(devices),
+        "avg_wifi_rssi_dbm": avg_rssi,
+        "avg_bandwidth_mbps": avg_bw,
+        "poor_signal_devices": [n["device_id"] for n in nodes if n["signal_quality"] == "poor"],
+        "topology": nodes,
+    }
+
+
+# ===== MONITORING LAYER (Monitoring & Management — NOC Dashboard) =====
+
+@app.get("/api/fleet/health")
+def fleet_health(license_key: str, db: Session = Depends(get_db)):
+    """
+    Full NOC dashboard — replaces Monitoring & Management.
+    Single endpoint showing all 18 data center capability layers.
+    """
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    all_devices = db.query(Device).filter(Device.company_id == company.id).all()
+    active = [d for d in all_devices if d.last_seen and d.last_seen >= cutoff]
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    queries_today = db.query(Query).filter(
+        Query.company_id == company.id,
+        Query.created_at >= today_start,
+    ).count()
+
+    active_alerts = db.query(FleetAlert).filter(
+        FleetAlert.company_id == company.id,
+        FleetAlert.is_resolved == False,
+    ).order_by(FleetAlert.created_at.desc()).limit(20).all()
+
+    storage_stats = fleet_storage_stats(company.id, db)
+
+    rssi_vals = [d.wifi_rssi_dbm for d in active if d.wifi_rssi_dbm is not None]
+    avg_rssi = round(sum(rssi_vals) / len(rssi_vals), 1) if rssi_vals else None
+
+    return {
+        # Compute layer (Server Racks + GPU/AI Servers)
+        "compute": {
+            "active_devices": len(active),
+            "total_devices": len(all_devices),
+            "queries_today": queries_today,
+            "power_eligible": sum(1 for d in active if is_power_eligible(d)),
+            "thermal_eligible": sum(1 for d in active if is_thermally_eligible(d)),
+        },
+        # Power layer (Grid + Generators + UPS + PDUs)
+        "power": {
+            "fleet_battery_avg": round(sum(d.battery_level or 100 for d in active) / len(active), 1) if active else None,
+            "charging_devices": sum(1 for d in active if d.is_charging),
+            "reserve_pool_size": len(get_reserve_pool(active)),
+            "low_battery_count": sum(1 for d in active if (d.battery_level or 100) < 30),
+        },
+        # Thermal layer (Chillers + Cooling Towers + CRAC/CRAH + Underfloor)
+        "thermal": fleet_thermal_health(active),
+        # Storage layer (Storage Systems)
+        "storage": storage_stats,
+        # Security layer (Physical Security + Fire Suppression)
+        "security": {
+            "quarantined_devices": sum(1 for d in all_devices if d.is_quarantined),
+            "hardware_attested": sum(1 for d in active if d.hardware_attested),
+            "unattested_count": sum(1 for d in active if not d.hardware_attested),
+        },
+        # Network layer (Cabling + Switches + Patch Panels + Raised Floor)
+        "network": {
+            "avg_wifi_rssi_dbm": avg_rssi,
+            "poor_signal_count": sum(
+                1 for d in active if d.wifi_rssi_dbm is not None and d.wifi_rssi_dbm < -70
+            ),
+        },
+        # Active alerts (Monitoring & Management NOC)
+        "active_alerts": [
+            {
+                "id": a.id,
+                "severity": a.severity,
+                "type": a.alert_type,
+                "device_id": a.device_id,
+                "message": a.message,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in active_alerts
+        ],
+    }
+
+
+@app.get("/api/fleet/alerts")
+def fleet_alerts(license_key: str, resolved: bool = False, db: Session = Depends(get_db)):
+    """Alert log — NOC alert management."""
+    company = _resolve_company_by_license(db, license_key)
+    query = db.query(FleetAlert).filter(
+        FleetAlert.company_id == company.id,
+        FleetAlert.is_resolved == resolved,
+    ).order_by(FleetAlert.created_at.desc()).limit(100)
+
+    return {
+        "alerts": [
+            {
+                "id": a.id,
+                "severity": a.severity,
+                "type": a.alert_type,
+                "device_id": a.device_id,
+                "message": a.message,
+                "created_at": a.created_at.isoformat(),
+                "is_resolved": a.is_resolved,
+            }
+            for a in query.all()
+        ]
+    }
+
+
+@app.post("/api/fleet/alerts/{alert_id}/resolve")
+def resolve_alert(alert_id: int, license_key: str, db: Session = Depends(get_db)):
+    """Mark an alert as resolved."""
+    company = _resolve_company_by_license(db, license_key)
+    alert = db.query(FleetAlert).filter(
+        FleetAlert.id == alert_id,
+        FleetAlert.company_id == company.id,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.is_resolved = True
+    alert.resolved_at = datetime.utcnow()
+    db.commit()
+    return {"resolved": True}
+
+
 @app.get("/api/roles")
 def get_roles():
     return ROLES
+
+
+# ===== MODEL SHARDING (pipeline-parallel inference across phone fleet) =====
+
+from shard_coordinator import (
+    MODEL_SPECS, plan_shards, configure_shard_devices,
+    run_sharded_inference, get_fleet_shard_status,
+)
+
+
+@app.get("/api/sharding/models")
+def list_shard_models():
+    """List models that support sharded inference and their requirements."""
+    return {
+        "models": [
+            {
+                "name": name,
+                "num_layers": spec["num_layers"],
+                "hidden_dim": spec["hidden_dim"],
+                "min_ram_per_shard_mb": spec["min_ram_per_shard_mb"],
+                "description": spec["description"],
+            }
+            for name, spec in MODEL_SPECS.items()
+        ]
+    }
+
+
+@app.get("/api/sharding/plan")
+def get_shard_plan(license_key: str, model: str, db: Session = Depends(get_db)):
+    """
+    Plan layer assignments across the current fleet for a given model.
+    Does not configure devices — call /api/sharding/configure to apply.
+    """
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+        Device.is_quarantined == False,
+    ).all()
+
+    plan = plan_shards(model, active)
+    return {
+        "feasible": plan.feasible,
+        "reason": plan.reason if not plan.feasible else None,
+        "model": plan.model_name,
+        "total_shards": plan.total_shards,
+        "total_layers": plan.total_layers,
+        "hidden_dim": plan.hidden_dim,
+        "shard_assignments": [
+            {
+                "shard_index": s.shard_index,
+                "device_id": s.device_id,
+                "device_ip": s.device_ip,
+                "layers": f"{s.layer_start}–{s.layer_end - 1}",
+                "layer_count": s.layer_end - s.layer_start,
+                "is_final_shard": s.is_final_shard,
+                "ram_available_mb": s.ram_available_mb,
+            }
+            for s in plan.shards
+        ] if plan.feasible else [],
+    }
+
+
+@app.post("/api/sharding/configure")
+async def configure_sharding(
+    license_key: str,
+    model: str,
+    model_base_path: str = "/sdcard/fleetmind/models",
+    db: Session = Depends(get_db),
+):
+    """
+    Plan and push shard configuration to devices.
+    Each device receives its layer range, model path, and next-shard URL.
+    """
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+        Device.is_quarantined == False,
+    ).all()
+
+    plan = plan_shards(model, active)
+    if not plan.feasible:
+        raise HTTPException(status_code=409, detail=plan.reason)
+
+    results = await configure_shard_devices(plan, model_base_path)
+    configured = sum(1 for ok in results.values() if ok)
+
+    return {
+        "model": model,
+        "total_shards": plan.total_shards,
+        "configured": configured,
+        "failed": plan.total_shards - configured,
+        "device_results": results,
+        "ready": configured == plan.total_shards,
+    }
+
+
+@app.post("/api/sharding/infer")
+async def sharded_inference(
+    license_key: str,
+    model: str,
+    prompt: str,
+    max_new_tokens: int = 256,
+    temperature: float = 0.7,
+    db: Session = Depends(get_db),
+):
+    """
+    Run sharded inference for a prompt across the phone fleet.
+    The fleet must already be configured via /api/sharding/configure.
+
+    Token IDs are computed via a simple BPE stub (production: use proper tokenizer).
+    For now, returns raw token IDs — wire in a Hugging Face tokenizer server for text.
+    """
+    company = _resolve_company_by_license(db, license_key)
+    status, _ = _license_status(company)
+    if status == "expired":
+        raise HTTPException(status_code=403, detail="License expired")
+
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+        Device.is_quarantined == False,
+    ).all()
+
+    plan = plan_shards(model, active)
+    if not plan.feasible:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Fleet cannot run {model}: {plan.reason}",
+        )
+
+    # Simple token encoding stub — each UTF-8 byte becomes a token ID.
+    # Replace with proper tokenizer (llama.cpp tokenizer server or HuggingFace) in production.
+    token_ids = list(prompt.encode("utf-8"))
+
+    try:
+        result = await run_sharded_inference(
+            plan, token_ids, max_new_tokens=max_new_tokens, temperature=temperature
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sharded inference failed: {e}")
+
+    return {
+        **result,
+        "prompt_tokens": len(token_ids),
+        "cost_usd": 0.0,
+        "egress_bytes": 0,
+    }
+
+
+@app.get("/api/sharding/status")
+async def sharding_status(license_key: str, db: Session = Depends(get_db)):
+    """Poll each device for shard readiness and RAM availability."""
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+    ).all()
+
+    fleet_status = await get_fleet_shard_status(active)
+    total_ram_mb = sum(s.get("ram_available_mb") or 0 for s in fleet_status)
+
+    feasibility = {}
+    for model_name in MODEL_SPECS:
+        plan = plan_shards(model_name, active)
+        feasibility[model_name] = {
+            "feasible": plan.feasible,
+            "shards_needed": plan.total_shards,
+            "reason": plan.reason if not plan.feasible else None,
+        }
+
+    return {
+        "fleet_total_ram_mb": total_ram_mb,
+        "fleet_total_ram_gb": round(total_ram_mb / 1024, 1),
+        "active_devices": len(active),
+        "devices": fleet_status,
+        "model_feasibility": feasibility,
+    }

@@ -67,6 +67,9 @@ class FleetMindService : Service() {
     private var serverSocket: ServerSocket? = null
     private var heartbeatJob: Job? = null
     private var localServerJob: Job? = null
+    private lateinit var telemetry: TelemetryCollector
+    private lateinit var chunkStorage: ChunkStorage
+    private lateinit var shardedInference: ShardedInference
 
     private val prefs by lazy { getSharedPreferences("fleetmind", Context.MODE_PRIVATE) }
     private val deviceId by lazy { Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) }
@@ -79,6 +82,9 @@ class FleetMindService : Service() {
         wakeLock = wm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FleetMind::InferenceWakeLock")
         meshDiscovery = MeshDiscovery(this)
         trustZoneKeyManager = TrustZoneKeyManager(this)
+        telemetry = TelemetryCollector(this)
+        chunkStorage = ChunkStorage(this)
+        shardedInference = ShardedInference(this)
         uptimeStart.set(System.currentTimeMillis())
     }
 
@@ -100,6 +106,7 @@ class FleetMindService : Service() {
         scope.cancel()
         meshDiscovery.stop()
         serverSocket?.runCatching { close() }
+        shardedInference.destroy()
         if (wakeLock.isHeld) wakeLock.release()
     }
 
@@ -160,6 +167,7 @@ class FleetMindService : Service() {
         val serverUrl = prefs.getString("server_url", "https://api.fleetmind.io") ?: return
 
         val uptimeSec = (System.currentTimeMillis() - uptimeStart.get()) / 1000
+        val t = telemetry.collect()
 
         val payload = JsonObject().apply {
             addProperty("license_key", licenseKey)
@@ -167,17 +175,31 @@ class FleetMindService : Service() {
             addProperty("device_model", deviceModel)
             addProperty("queries_processed", queriesToday.get())
             addProperty("uptime_seconds", uptimeSec)
+            // Power layer
+            addProperty("battery_level", t.batteryLevel)
+            addProperty("is_charging", t.isCharging)
+            t.estimatedRuntimeMins?.let { addProperty("estimated_runtime_mins", it) }
+            // Thermal layer
+            t.cpuTempCelsius?.let { addProperty("cpu_temp_celsius", it) }
+            addProperty("thermal_state", t.thermalState)
+            // Network layer
+            t.wifiRssiDbm?.let { addProperty("wifi_rssi_dbm", it) }
+            t.networkBandwidthMbps?.let { addProperty("network_bandwidth_mbps", it) }
+            // Compute
+            t.cpuUsagePercent?.let { addProperty("cpu_usage_percent", it) }
+            addProperty("ram_available_mb", t.ramAvailableMb)
+            // Storage
+            addProperty("available_storage_mb", t.availableStorageMb - chunkStorage.getTotalUsedMb())
         }
 
-        val body = gson.toJson(payload)
-            .toRequestBody("application/json".toMediaType())
+        val body = gson.toJson(payload).toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
             .url("$serverUrl/api/device/heartbeat")
             .post(body)
             .build()
 
         withContext(Dispatchers.IO) {
-            http.newCall(request).execute().use { /* fire-and-forget; log failures silently */ }
+            http.newCall(request).execute().use { /* fire-and-forget */ }
         }
     }
 
@@ -193,15 +215,9 @@ class FleetMindService : Service() {
 
     private suspend fun handleClientConnection(socket: Socket) = withContext(Dispatchers.IO) {
         socket.use {
-            if (!isBatteryOk()) {
-                writeHttpResponse(socket, 503, """{"error":"device battery low, pausing inference"}""")
-                return@withContext
-            }
-
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
             val requestLine = reader.readLine() ?: return@withContext
 
-            // Read headers first (always needed to determine content length and route)
             var contentLength = 0
             var line = reader.readLine()
             while (line != null && line.isNotEmpty()) {
@@ -211,58 +227,263 @@ class FleetMindService : Service() {
                 line = reader.readLine()
             }
 
-            // Handle secure encrypted query endpoint
-            if (requestLine.startsWith("POST /api/secure/query")) {
-                handleSecureQuery(socket, reader, contentLength)
-                return@withContext
+            when {
+                // ── Inference ──────────────────────────────────────────────────
+                requestLine.startsWith("POST /api/secure/query") ->
+                    handleSecureQuery(socket, reader, contentLength)
+
+                requestLine.startsWith("POST /api/generate") ->
+                    handleGenerate(socket, reader, contentLength)
+
+                // ── Model sharding pipeline ────────────────────────────────────
+                requestLine.startsWith("POST /shard/forward") ->
+                    handleShardForward(socket, reader, contentLength)
+
+                requestLine.startsWith("POST /shard/configure") ->
+                    handleShardConfigure(socket, reader, contentLength)
+
+                requestLine.startsWith("GET /shard/status") ->
+                    handleShardStatus(socket)
+
+                // ── Chunk storage ──────────────────────────────────────────────
+                requestLine.startsWith("POST /chunk/store") ->
+                    handleChunkStore(socket, reader, contentLength)
+
+                requestLine.startsWith("GET /chunk/") ->
+                    handleChunkRetrieve(socket, requestLine)
+
+                requestLine.startsWith("DELETE /chunk/") ->
+                    handleChunkDelete(socket, requestLine)
+
+                requestLine.startsWith("GET /chunk") ->
+                    handleChunkList(socket)
+
+                else ->
+                    writeHttpResponse(socket, 404, """{"error":"not found"}""")
             }
-
-            // Only handle POST /api/generate (Ollama-compatible endpoint)
-            if (!requestLine.startsWith("POST /api/generate")) {
-                writeHttpResponse(socket, 404, """{"error":"not found"}""")
-                return@withContext
-            }
-
-            val bodyChars = CharArray(contentLength)
-            reader.read(bodyChars, 0, contentLength)
-            val bodyJson = String(bodyChars)
-
-            val prompt = runCatching {
-                gson.fromJson(bodyJson, JsonObject::class.java).get("prompt").asString
-            }.getOrElse { "" }
-
-            if (prompt.isBlank()) {
-                writeHttpResponse(socket, 400, """{"error":"prompt required"}""")
-                return@withContext
-            }
-
-            // Check mesh peers for load balancing before inference
-            val peer = meshDiscovery.getAvailablePeer()
-            if (peer != null) {
-                val redirectResponse = JsonObject().apply {
-                    addProperty("redirect", "http://${peer.host}:${peer.port}/api/generate")
-                    addProperty("reason", "load_balance")
-                }
-                writeHttpResponse(socket, 307, gson.toJson(redirectResponse))
-                return@withContext
-            }
-
-            // Acquire wake lock during inference to prevent CPU throttle
-            if (!wakeLock.isHeld) wakeLock.acquire(30_000L)
-
-            val response = runInference(prompt)
-
-            if (wakeLock.isHeld) wakeLock.release()
-
-            queriesToday.incrementAndGet()
-
-            val responseJson = JsonObject().apply {
-                addProperty("model", "fleetmind-local")
-                addProperty("response", response)
-                addProperty("done", true)
-            }
-            writeHttpResponse(socket, 200, gson.toJson(responseJson))
         }
+    }
+
+    // ── Inference ────────────────────────────────────────────────────────────────
+
+    private suspend fun handleGenerate(
+        socket: Socket,
+        reader: BufferedReader,
+        contentLength: Int,
+    ) = withContext(Dispatchers.IO) {
+        if (!isBatteryOk()) {
+            writeHttpResponse(socket, 503, """{"error":"device battery low, pausing inference"}""")
+            return@withContext
+        }
+        val bodyChars = CharArray(contentLength)
+        reader.read(bodyChars, 0, contentLength)
+        val bodyJson = String(bodyChars)
+
+        val prompt = runCatching {
+            gson.fromJson(bodyJson, JsonObject::class.java).get("prompt").asString
+        }.getOrElse { "" }
+
+        if (prompt.isBlank()) {
+            writeHttpResponse(socket, 400, """{"error":"prompt required"}""")
+            return@withContext
+        }
+
+        val peer = meshDiscovery.getAvailablePeer()
+        if (peer != null) {
+            val redirectResponse = JsonObject().apply {
+                addProperty("redirect", "http://${peer.host}:${peer.port}/api/generate")
+                addProperty("reason", "load_balance")
+            }
+            writeHttpResponse(socket, 307, gson.toJson(redirectResponse))
+            return@withContext
+        }
+
+        if (!wakeLock.isHeld) wakeLock.acquire(30_000L)
+        val response = runInference(prompt)
+        if (wakeLock.isHeld) wakeLock.release()
+        queriesToday.incrementAndGet()
+
+        val responseJson = JsonObject().apply {
+            addProperty("model", "fleetmind-local")
+            addProperty("response", response)
+            addProperty("done", true)
+        }
+        writeHttpResponse(socket, 200, gson.toJson(responseJson))
+    }
+
+    // ── Model sharding ────────────────────────────────────────────────────────────
+
+    private suspend fun handleShardForward(
+        socket: Socket,
+        reader: BufferedReader,
+        contentLength: Int,
+    ) = withContext(Dispatchers.IO) {
+        if (!shardedInference.isConfigured()) {
+            writeHttpResponse(socket, 503, """{"error":"shard not configured"}""")
+            return@withContext
+        }
+
+        val bodyChars = CharArray(contentLength)
+        reader.read(bodyChars, 0, contentLength)
+        val json = runCatching {
+            gson.fromJson(String(bodyChars), JsonObject::class.java)
+        }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"invalid json"}""")
+            return@withContext
+        }
+
+        val inputB64 = json.get("hidden_state_b64")?.asString
+            ?: json.get("token_ids_b64")?.asString
+            ?: run {
+                writeHttpResponse(socket, 400, """{"error":"hidden_state_b64 or token_ids_b64 required"}""")
+                return@withContext
+            }
+        val inputData = runCatching { Base64.decode(inputB64, Base64.NO_WRAP) }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"base64 decode failed"}""")
+            return@withContext
+        }
+
+        if (!wakeLock.isHeld) wakeLock.acquire(120_000L)
+        val output = runCatching { shardedInference.forward(inputData) }.getOrElse {
+            if (wakeLock.isHeld) wakeLock.release()
+            writeHttpResponse(socket, 500, """{"error":"shard forward failed: ${it.message}"}""")
+            return@withContext
+        }
+        if (wakeLock.isHeld) wakeLock.release()
+
+        val responseJson = JsonObject().apply {
+            addProperty("output_b64", Base64.encodeToString(output, Base64.NO_WRAP))
+            addProperty("device_id", deviceId)
+            addProperty("output_bytes", output.size)
+        }
+        writeHttpResponse(socket, 200, gson.toJson(responseJson))
+    }
+
+    private suspend fun handleShardConfigure(
+        socket: Socket,
+        reader: BufferedReader,
+        contentLength: Int,
+    ) = withContext(Dispatchers.IO) {
+        val bodyChars = CharArray(contentLength)
+        reader.read(bodyChars, 0, contentLength)
+        val json = runCatching {
+            gson.fromJson(String(bodyChars), JsonObject::class.java)
+        }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"invalid json"}""")
+            return@withContext
+        }
+
+        val config = ShardedInference.ShardConfig(
+            shardIndex   = json.get("shard_index")?.asInt ?: 0,
+            totalShards  = json.get("total_shards")?.asInt ?: 1,
+            layerStart   = json.get("layer_start")?.asInt ?: 0,
+            layerEnd     = json.get("layer_end")?.asInt ?: 32,
+            isFinalShard = json.get("is_final_shard")?.asBoolean ?: true,
+            modelPath    = json.get("model_path")?.asString ?: "",
+            nextShardUrl = json.get("next_shard_url")?.asString,
+            hiddenDim    = json.get("hidden_dim")?.asInt ?: 8192,
+            threads      = json.get("threads")?.asInt ?: 4,
+        )
+
+        if (config.modelPath.isBlank()) {
+            writeHttpResponse(socket, 400, """{"error":"model_path required"}""")
+            return@withContext
+        }
+
+        val ok = shardedInference.configure(config)
+        val response = JsonObject().apply {
+            addProperty("configured", ok)
+            addProperty("shard_index", config.shardIndex)
+            addProperty("layer_start", config.layerStart)
+            addProperty("layer_end", config.layerEnd)
+            addProperty("is_final_shard", config.isFinalShard)
+        }
+        writeHttpResponse(socket, if (ok) 200 else 500, gson.toJson(response))
+    }
+
+    private fun handleShardStatus(socket: Socket) {
+        val cfg = shardedInference.isConfigured()
+        val response = JsonObject().apply {
+            addProperty("shard_ready", cfg)
+            addProperty("device_id", deviceId)
+            addProperty("ram_available_mb", telemetry.getRamAvailableMb())
+        }
+        writeHttpResponse(socket, 200, gson.toJson(response))
+    }
+
+    // ── Chunk storage ─────────────────────────────────────────────────────────────
+
+    private suspend fun handleChunkStore(
+        socket: Socket,
+        reader: BufferedReader,
+        contentLength: Int,
+    ) = withContext(Dispatchers.IO) {
+        val bodyChars = CharArray(contentLength)
+        reader.read(bodyChars, 0, contentLength)
+        val json = runCatching {
+            gson.fromJson(String(bodyChars), JsonObject::class.java)
+        }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"invalid json"}""")
+            return@withContext
+        }
+
+        val chunkId = json.get("chunk_id")?.asString ?: run {
+            writeHttpResponse(socket, 400, """{"error":"chunk_id required"}""")
+            return@withContext
+        }
+        val dataB64 = json.get("data_b64")?.asString ?: run {
+            writeHttpResponse(socket, 400, """{"error":"data_b64 required"}""")
+            return@withContext
+        }
+
+        val data = runCatching { Base64.decode(dataB64, Base64.NO_WRAP) }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"base64 decode failed"}""")
+            return@withContext
+        }
+
+        val ok = chunkStorage.storeChunk(chunkId, data)
+        val resp = JsonObject().apply {
+            addProperty("stored", ok)
+            addProperty("chunk_id", chunkId)
+            addProperty("size_bytes", data.size)
+        }
+        writeHttpResponse(socket, if (ok) 200 else 500, gson.toJson(resp))
+    }
+
+    private fun handleChunkRetrieve(socket: Socket, requestLine: String) {
+        // GET /chunk/{chunkId}
+        val chunkId = requestLine.removePrefix("GET /chunk/").substringBefore(" ")
+        val data = chunkStorage.retrieveChunk(chunkId)
+        if (data == null) {
+            writeHttpResponse(socket, 404, """{"error":"chunk not found"}""")
+            return
+        }
+        val resp = JsonObject().apply {
+            addProperty("chunk_id", chunkId)
+            addProperty("data_b64", Base64.encodeToString(data, Base64.NO_WRAP))
+            addProperty("size_bytes", data.size)
+        }
+        writeHttpResponse(socket, 200, gson.toJson(resp))
+    }
+
+    private fun handleChunkDelete(socket: Socket, requestLine: String) {
+        val chunkId = requestLine.removePrefix("DELETE /chunk/").substringBefore(" ")
+        val ok = chunkStorage.deleteChunk(chunkId)
+        writeHttpResponse(socket, if (ok) 200 else 404,
+            if (ok) """{"deleted":true,"chunk_id":"$chunkId"}""" else """{"error":"chunk not found"}""")
+    }
+
+    private fun handleChunkList(socket: Socket) {
+        val chunks = chunkStorage.listChunks()
+        val usedMb = chunkStorage.getTotalUsedMb()
+        val resp = JsonObject().apply {
+            addProperty("chunk_count", chunks.size)
+            addProperty("used_mb", usedMb)
+            val arr = com.google.gson.JsonArray()
+            chunks.forEach { arr.add(it) }
+            add("chunks", arr)
+        }
+        writeHttpResponse(socket, 200, gson.toJson(resp))
     }
 
     private suspend fun handleSecureQuery(
@@ -393,6 +614,7 @@ class FleetMindService : Service() {
             400 -> "Bad Request"
             403 -> "Forbidden"
             404 -> "Not Found"
+            500 -> "Internal Server Error"
             503 -> "Service Unavailable"
             else -> "Unknown"
         }
