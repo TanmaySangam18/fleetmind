@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Float
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Float, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from dotenv import load_dotenv
@@ -48,6 +48,9 @@ class Device(Base):
     queries_processed = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     operator_role = Column(String, default="engineer")
+    public_key = Column(Text, nullable=True)
+    hardware_attested = Column(Boolean, default=False)
+    attestation_verified_at = Column(DateTime, nullable=True)
 
     company = relationship("Company", back_populates="devices")
     queries = relationship("Query", back_populates="device")

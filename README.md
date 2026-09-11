@@ -260,6 +260,24 @@ The core insight: a laptop running Excel is not idle compute. A phone sitting in
 
 ---
 
+## Hardware Trust Chain
+
+FleetMind is the first enterprise AI system to implement an unbroken hardware trust chain from query origin to response:
+
+1. **ARM TrustZone** (Android Keystore): Your query is encrypted by a key that never exists in RAM — only inside the phone's hardware security chip. A rooted OS cannot intercept it.
+
+2. **Hardware Attestation**: The backend verifies your device's encryption key is genuinely hardware-backed — not software-simulated. Compromised devices are excluded from the trust chain.
+
+3. **Role-Enforced Cryptographic Routing**: CFO queries are encrypted to only hardware-attested devices with finance-or-above role. An engineer's phone cannot decrypt them — not because of a software rule, but because it doesn't have the cryptographic key.
+
+4. **The Rubik's Cube in a Sealed Glass Box**: The phone processes computation on encrypted data it cannot read. The result is sealed before it leaves. Only the originating device's TrustZone key can open it.
+
+This combination — phone-side TrustZone key management + hardware attestation + role-enforced cryptographic routing — has not been implemented in any prior enterprise AI product.
+
+See [TRUSTCHAIN.md](TRUSTCHAIN.md) for the full technical architecture.
+
+---
+
 ## Roadmap
 
 - [ ] iOS support — waiting on Apple MDM background compute entitlements

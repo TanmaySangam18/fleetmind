@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Base64
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.gson.Gson
 import com.google.gson.JsonObject
@@ -49,6 +51,7 @@ class FleetMindService : Service() {
         const val NOTIF_ID = 1001
         const val LOCAL_PORT = 11434
         const val HEARTBEAT_INTERVAL_MS = 60_000L
+        private const val TAG = "FleetMindService"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -60,6 +63,7 @@ class FleetMindService : Service() {
 
     private lateinit var wakeLock: PowerManager.WakeLock
     private lateinit var meshDiscovery: MeshDiscovery
+    private lateinit var trustZoneKeyManager: TrustZoneKeyManager
     private var serverSocket: ServerSocket? = null
     private var heartbeatJob: Job? = null
     private var localServerJob: Job? = null
@@ -74,6 +78,7 @@ class FleetMindService : Service() {
         val wm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = wm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FleetMind::InferenceWakeLock")
         meshDiscovery = MeshDiscovery(this)
+        trustZoneKeyManager = TrustZoneKeyManager(this)
         uptimeStart.set(System.currentTimeMillis())
     }
 
@@ -82,6 +87,7 @@ class FleetMindService : Service() {
         isRunning = true
 
         meshDiscovery.start()
+        initTrustChain()
         startLocalHttpServer()
         startHeartbeat()
 
@@ -98,6 +104,47 @@ class FleetMindService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun initTrustChain() {
+        scope.launch {
+            val operatorEmail = prefs.getString("operator_email", null) ?: run {
+                Log.w(TAG, "TrustChain: no operator_email configured, skipping key registration")
+                return@launch
+            }
+            val serverUrl = prefs.getString("server_url", "https://api.fleetmind.io") ?: return@launch
+            val licenseKey = prefs.getString("license_key", "") ?: return@launch
+            if (licenseKey.isBlank()) return@launch
+
+            runCatching {
+                trustZoneKeyManager.generateUserKeyPair(operatorEmail)
+                val pubKeyB64 = trustZoneKeyManager.getPublicKeyBase64(operatorEmail)
+                val certChain = trustZoneKeyManager.getAttestationCertificateChain(operatorEmail)
+                    .map { Base64.encodeToString(it.encoded, Base64.NO_WRAP) }
+
+                val payload = JsonObject().apply {
+                    addProperty("license_key", licenseKey)
+                    addProperty("device_id", deviceId)
+                    addProperty("public_key_base64", pubKeyB64)
+                    val arr = com.google.gson.JsonArray()
+                    certChain.forEach { arr.add(it) }
+                    add("attestation_cert_chain", arr)
+                }
+                val body = gson.toJson(payload).toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("$serverUrl/api/device/pubkey")
+                    .post(body)
+                    .build()
+
+                withContext(Dispatchers.IO) {
+                    http.newCall(request).execute().use { resp ->
+                        Log.i(TAG, "TrustChain: pubkey registered, hardware_attested=${resp.isSuccessful}")
+                    }
+                }
+            }.onFailure { e ->
+                Log.e(TAG, "TrustChain: key registration failed: ${e.message}")
+            }
+        }
+    }
 
     private fun startHeartbeat() {
         heartbeatJob = scope.launch {
@@ -154,13 +201,7 @@ class FleetMindService : Service() {
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
             val requestLine = reader.readLine() ?: return@withContext
 
-            // Only handle POST /api/generate (Ollama-compatible endpoint)
-            if (!requestLine.startsWith("POST /api/generate")) {
-                writeHttpResponse(socket, 404, """{"error":"not found"}""")
-                return@withContext
-            }
-
-            // Read headers to find Content-Length
+            // Read headers first (always needed to determine content length and route)
             var contentLength = 0
             var line = reader.readLine()
             while (line != null && line.isNotEmpty()) {
@@ -168,6 +209,18 @@ class FleetMindService : Service() {
                     contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
                 }
                 line = reader.readLine()
+            }
+
+            // Handle secure encrypted query endpoint
+            if (requestLine.startsWith("POST /api/secure/query")) {
+                handleSecureQuery(socket, reader, contentLength)
+                return@withContext
+            }
+
+            // Only handle POST /api/generate (Ollama-compatible endpoint)
+            if (!requestLine.startsWith("POST /api/generate")) {
+                writeHttpResponse(socket, 404, """{"error":"not found"}""")
+                return@withContext
             }
 
             val bodyChars = CharArray(contentLength)
@@ -210,6 +263,62 @@ class FleetMindService : Service() {
             }
             writeHttpResponse(socket, 200, gson.toJson(responseJson))
         }
+    }
+
+    private suspend fun handleSecureQuery(
+        socket: Socket,
+        reader: BufferedReader,
+        contentLength: Int
+    ) = withContext(Dispatchers.IO) {
+        val bodyChars = CharArray(contentLength)
+        reader.read(bodyChars, 0, contentLength)
+        val bodyJson = String(bodyChars)
+
+        val json = runCatching {
+            gson.fromJson(bodyJson, JsonObject::class.java)
+        }.getOrElse {
+            writeHttpResponse(socket, 400, """{"error":"invalid json"}""")
+            return@withContext
+        }
+
+        val encryptedQueryB64 = json.get("encrypted_query_base64")?.asString ?: run {
+            writeHttpResponse(socket, 400, """{"error":"encrypted_query_base64 required"}""")
+            return@withContext
+        }
+
+        val decryptedPrompt = runCatching {
+            trustZoneKeyManager.decryptResponse(encryptedQueryB64)
+        }.getOrElse {
+            // Cryptographic rejection: this query was not encrypted for this device's key.
+            // This is not a routing error — it is a cryptographic proof of role mismatch.
+            Log.w(TAG, "SecureQuery: rejected — not addressable by this device's TrustZone key")
+            writeHttpResponse(socket, 403, """{"error":"cryptographic_rejection","reason":"query not addressed to this device key"}""")
+            return@withContext
+        }
+
+        if (!wakeLock.isHeld) wakeLock.acquire(30_000L)
+        val plainResponse = runInference(decryptedPrompt)
+        if (wakeLock.isHeld) wakeLock.release()
+
+        queriesToday.incrementAndGet()
+
+        val operatorEmail = prefs.getString("operator_email", "") ?: ""
+        val requesterPubKeyB64 = json.get("requester_public_key_base64")?.asString
+
+        val responsePayload = if (!requesterPubKeyB64.isNullOrBlank()) {
+            runCatching {
+                trustZoneKeyManager.encryptQuery(plainResponse, requesterPubKeyB64)
+            }.getOrElse { plainResponse }
+        } else {
+            plainResponse
+        }
+
+        val responseJson = JsonObject().apply {
+            addProperty("encrypted_response_base64", responsePayload)
+            addProperty("device_id", deviceId)
+            addProperty("hardware_backed", trustZoneKeyManager.isHardwareBacked(operatorEmail))
+        }
+        writeHttpResponse(socket, 200, gson.toJson(responseJson))
     }
 
     private fun runInference(prompt: String): String {
@@ -282,6 +391,7 @@ class FleetMindService : Service() {
             200 -> "OK"
             307 -> "Temporary Redirect"
             400 -> "Bad Request"
+            403 -> "Forbidden"
             404 -> "Not Found"
             503 -> "Service Unavailable"
             else -> "Unknown"

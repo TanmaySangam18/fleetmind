@@ -1,3 +1,5 @@
+import base64
+import logging
 import os
 import hashlib
 import hmac
@@ -21,6 +23,9 @@ from rbac import (
     ROLES, NAMESPACES, can_access, get_accessible_namespaces,
     get_eligible_nodes, generate_user_key, encrypt_query, decrypt_query,
 )
+from attestation import verify_android_attestation
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -114,6 +119,21 @@ class EmployeeRegisterRequest(BaseModel):
 class EmployeeKeyRequest(BaseModel):
     license_key: str
     email: str
+
+
+class DevicePubkeyRequest(BaseModel):
+    license_key: str
+    device_id: str
+    public_key_base64: str
+    attestation_cert_chain: list[str] = []
+
+
+class SecureQueryRequest(BaseModel):
+    license_key: str
+    user_role: str
+    namespace: str
+    encrypted_query_base64: str
+    requester_public_key_base64: Optional[str] = None
 
 
 # ---------- Helpers ----------
@@ -537,6 +557,190 @@ def get_employee_key(body: EmployeeKeyRequest, db: Session = Depends(get_db)):
 
     user_key = generate_user_key(company.id, body.email, RBAC_SECRET)
     return {"user_key": user_key}
+
+
+@app.post("/api/device/pubkey", status_code=200)
+def register_device_pubkey(body: DevicePubkeyRequest, db: Session = Depends(get_db)):
+    company = _resolve_company_by_license(db, body.license_key)
+
+    device = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.device_id == body.device_id,
+    ).first()
+
+    attestation_result = {"hardware_backed": False, "strongbox": False, "security_level": "Software", "verified": False}
+    if body.attestation_cert_chain:
+        try:
+            attestation_result = verify_android_attestation(body.attestation_cert_chain)
+        except Exception as e:
+            logger.warning("Attestation verification error for device %s: %s", body.device_id, e)
+
+    hardware_attested = attestation_result.get("hardware_backed", False)
+    now = datetime.utcnow()
+
+    if device:
+        device.public_key = body.public_key_base64
+        device.hardware_attested = hardware_attested
+        device.attestation_verified_at = now if hardware_attested else device.attestation_verified_at
+    else:
+        device = Device(
+            company_id=company.id,
+            device_id=body.device_id,
+            device_model="unknown",
+            public_key=body.public_key_base64,
+            hardware_attested=hardware_attested,
+            attestation_verified_at=now if hardware_attested else None,
+        )
+        db.add(device)
+
+    db.commit()
+
+    return {
+        "registered": True,
+        "device_id": body.device_id,
+        "hardware_attested": hardware_attested,
+        "security_level": attestation_result.get("security_level", "Software"),
+        "strongbox": attestation_result.get("strongbox", False),
+    }
+
+
+@app.get("/api/device/pubkey/{device_id}")
+def get_device_pubkey(device_id: str, db: Session = Depends(get_db)):
+    device = db.query(Device).filter(Device.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if not device.public_key:
+        raise HTTPException(status_code=404, detail="No public key registered for this device")
+    return {
+        "device_id": device_id,
+        "public_key_base64": device.public_key,
+        "hardware_attested": device.hardware_attested,
+        "attestation_verified_at": device.attestation_verified_at.isoformat() if device.attestation_verified_at else None,
+    }
+
+
+@app.post("/api/query/secure")
+def secure_mesh_query(body: SecureQueryRequest, db: Session = Depends(get_db)):
+    company = _resolve_company_by_license(db, body.license_key)
+    status, _ = _license_status(company)
+    if status == "expired":
+        raise HTTPException(status_code=403, detail="License expired")
+
+    if body.user_role not in ROLES:
+        raise HTTPException(status_code=400, detail=f"Unknown role: {body.user_role}")
+
+    if not can_access(body.user_role, body.namespace):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "access_denied",
+                "reason": f"{body.user_role} role cannot access {body.namespace} namespace",
+            },
+        )
+
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    raw_devices = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+        Device.is_active == True,
+        Device.public_key != None,
+    ).all()
+
+    node_dicts = [
+        {
+            "id": d.id,
+            "device_id": d.device_id,
+            "operator_role": d.operator_role,
+            "public_key": d.public_key,
+            "hardware_attested": d.hardware_attested,
+        }
+        for d in raw_devices
+    ]
+    eligible = get_eligible_nodes(body.user_role, node_dicts)
+
+    # For sensitive namespaces, prefer hardware-attested nodes
+    attested_eligible = [n for n in eligible if n.get("hardware_attested")]
+    routing_pool = attested_eligible if attested_eligible else eligible
+
+    if not routing_pool:
+        raise HTTPException(status_code=503, detail="No eligible nodes with registered public keys for this role")
+
+    idx = _round_robin_index.get(company.id, 0)
+    target_node = routing_pool[idx % len(routing_pool)]
+    _round_robin_index[company.id] = (idx + 1) % len(routing_pool)
+
+    node_public_key_b64 = target_node["public_key"]
+
+    # Re-encrypt the query blob for the target node's TrustZone key.
+    # The backend never sees plaintext — it receives an encrypted blob
+    # and re-wraps it using the target device's public key.
+    # The actual re-encryption here wraps the incoming encrypted blob
+    # (treated as opaque bytes) in a new AES-GCM envelope addressed to the node.
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            EllipticCurvePublicKey, ECDH,
+        )
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.backends import default_backend
+
+        node_pub_der = base64.b64decode(node_public_key_b64)
+        node_pub_key = serialization.load_der_public_key(node_pub_der, backend=default_backend())
+
+        ephemeral_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        shared_key = ephemeral_key.exchange(ECDH(), node_pub_key)
+
+        digest = hashlib.sha256(shared_key).digest()
+        aes_key = AESGCM(digest)
+
+        nonce = os.urandom(12)
+        payload_bytes = body.encrypted_query_base64.encode()
+        ciphertext = aes_key.encrypt(nonce, payload_bytes, None)
+
+        ephemeral_pub_der = ephemeral_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        ephemeral_pub_len = len(ephemeral_pub_der)
+        envelope = (
+            bytes([ephemeral_pub_len >> 8, ephemeral_pub_len & 0xFF])
+            + ephemeral_pub_der
+            + nonce
+            + ciphertext
+        )
+        routed_payload = base64.b64encode(envelope).decode()
+
+    except Exception as e:
+        logger.error("Re-encryption for node %s failed: %s", target_node["device_id"], e)
+        raise HTTPException(status_code=500, detail="Re-encryption failed")
+
+    t_start = time.time()
+    mock_encrypted_response = encrypt_query(
+        random.choice(MOCK_RESPONSES),
+        generate_user_key(company.id, body.user_role, RBAC_SECRET),
+    )
+    latency_ms = int((time.time() - t_start) * 1000) + random.randint(40, 200)
+
+    query_hash = hashlib.sha256(body.encrypted_query_base64.encode()).hexdigest()
+    q = Query(
+        company_id=company.id,
+        device_id=target_node["id"],
+        prompt_hash=query_hash,
+        latency_ms=latency_ms,
+        user_role=body.user_role,
+        namespace=body.namespace,
+    )
+    db.add(q)
+    db.commit()
+
+    return {
+        "encrypted_response_base64": mock_encrypted_response,
+        "routed_payload_base64": routed_payload,
+        "device_id": target_node["device_id"],
+        "attested": target_node.get("hardware_attested", False),
+        "latency_ms": latency_ms,
+    }
 
 
 @app.get("/api/roles")

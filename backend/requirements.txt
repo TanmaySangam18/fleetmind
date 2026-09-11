@@ -8,3 +8,6 @@ python-multipart
 pydantic[email]
 python-dotenv
 cryptography
+pyOpenSSL
+pyasn1
+pyasn1-modules
