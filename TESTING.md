@@ -179,6 +179,54 @@ You should see each of the 4 nodes receive 2 queries each.
 
 ---
 
+---
+
+## Testing Role-Based Access Control
+
+```bash
+# Register two employees with different roles
+curl -X POST http://localhost:8000/api/employee/register \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","email":"engineer@acme.com","role":"engineer"}'
+
+curl -X POST http://localhost:8000/api/employee/register \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","email":"cfo@acme.com","role":"finance"}'
+
+# Get their keys
+ENGINEER_KEY=$(curl -s -X POST http://localhost:8000/api/employee/key \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","email":"engineer@acme.com"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['user_key'])")
+
+CFO_KEY=$(curl -s -X POST http://localhost:8000/api/employee/key \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","email":"cfo@acme.com"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['user_key'])")
+
+# Try to send a finance query as engineer — should be REJECTED
+curl -X POST http://localhost:8000/api/query/encrypted \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","encrypted_query":"...","user_role":"engineer","namespace":"finance"}'
+# Returns: {"detail": {"error": "access_denied", "reason": "engineer role cannot access finance namespace"}}
+
+# Send finance query as CFO — should SUCCEED and route only to finance+ nodes
+curl -X POST http://localhost:8000/api/query/encrypted \
+  -H "Content-Type: application/json" \
+  -d "{\"license_key\":\"TOKEN\",\"encrypted_query\":\"$(echo -n 'What is our Q3 revenue?' | python3 -c 'import sys; from rbac import encrypt_query; print(encrypt_query(sys.stdin.read(), \"'$CFO_KEY'\"))')\",\"user_role\":\"finance\",\"namespace\":\"finance\"}"
+
+# List all valid roles
+curl http://localhost:8000/api/roles
+
+# Register a device with operator_email to set operator_role automatically
+curl -X POST http://localhost:8000/api/device/heartbeat \
+  -H "Content-Type: application/json" \
+  -d '{"license_key":"TOKEN","device_id":"cfo-iphone","device_model":"iPhone 15","queries_processed":0,"uptime_seconds":0,"operator_email":"cfo@acme.com"}'
+
+# Run the standalone encryption demo
+cd ~/fleetmind/backend && python3 encryption_demo.py
+```
+
+---
+
 ## Troubleshooting
 
 **Dashboard shows 0 active devices after 90 seconds**

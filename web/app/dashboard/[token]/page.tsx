@@ -10,6 +10,14 @@ interface Device {
   status: "active" | "idle" | "offline";
   queries: number;
   last_seen: string;
+  operator_role?: string;
+}
+
+interface EmployeeRecord {
+  email: string;
+  role: string;
+  device_id: string | null;
+  status: "active" | "offline";
 }
 
 interface DashboardData {
@@ -20,6 +28,8 @@ interface DashboardData {
   total_queries: number;
   money_saved: number;
   devices: Device[];
+  employees?: EmployeeRecord[];
+  role_distribution?: Record<string, number>;
   company_name?: string;
 }
 
@@ -38,6 +48,24 @@ function StatusBadge({ status }: { status: "Trial" | "Active" }) {
         }`}
       />
       {status}
+    </span>
+  );
+}
+
+const ROLE_BADGE: Record<string, string> = {
+  engineer: "text-blue-400 border-blue-400/30 bg-blue-400/10",
+  operations: "text-green-400 border-green-400/30 bg-green-400/10",
+  hr: "text-yellow-400 border-yellow-400/30 bg-yellow-400/10",
+  finance: "text-orange-400 border-orange-400/30 bg-orange-400/10",
+  executive: "text-purple-400 border-purple-400/30 bg-purple-400/10",
+  admin: "text-red-400 border-red-400/30 bg-red-400/10",
+};
+
+function RoleBadge({ role }: { role: string }) {
+  const cls = ROLE_BADGE[role] ?? "text-white/50 border-white/20 bg-white/5";
+  return (
+    <span className={`inline-flex items-center text-xs font-mono px-2 py-0.5 rounded-full border ${cls}`}>
+      {role}
     </span>
   );
 }
@@ -251,6 +279,59 @@ export default function DashboardPage() {
                 </div>
               )}
             </div>
+
+            {/* Team section */}
+            {data.employees && (
+              <div className="border border-white/10 bg-white/5 rounded-xl overflow-hidden mb-8">
+                <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
+                  <h2 className="text-sm font-semibold">Team</h2>
+                  <span className="text-xs text-white/30 font-mono">
+                    {data.employees.length} employees
+                  </span>
+                </div>
+
+                {data.employees.length === 0 ? (
+                  <div className="px-6 py-12 text-center text-sm text-white/30">
+                    No employees registered yet. Use POST /api/employee/register to add team members.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-white/5">
+                          <th className="text-left px-6 py-3 text-xs font-medium text-white/40 uppercase tracking-wider">Email</th>
+                          <th className="text-left px-6 py-3 text-xs font-medium text-white/40 uppercase tracking-wider">Role</th>
+                          <th className="text-left px-6 py-3 text-xs font-medium text-white/40 uppercase tracking-wider">Device</th>
+                          <th className="text-left px-6 py-3 text-xs font-medium text-white/40 uppercase tracking-wider">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.employees.map((emp, i) => (
+                          <tr
+                            key={emp.email}
+                            className={`${i < data.employees!.length - 1 ? "border-b border-white/5" : ""} hover:bg-white/5 transition-colors`}
+                          >
+                            <td className="px-6 py-3 font-mono text-xs text-white/70">{emp.email}</td>
+                            <td className="px-6 py-3"><RoleBadge role={emp.role} /></td>
+                            <td className="px-6 py-3 font-mono text-xs text-white/50">{emp.device_id ?? "—"}</td>
+                            <td className="px-6 py-3">
+                              <span className="inline-flex items-center gap-2 text-xs">
+                                <span className={`w-2 h-2 rounded-full ${emp.status === "active" ? "bg-[#00ff87]" : "bg-white/20"}`} />
+                                <span className="capitalize text-white/60">{emp.status}</span>
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="px-6 py-3 border-t border-white/5 text-xs text-white/25">
+                  Queries are end-to-end encrypted. Devices only receive queries from their role level and above.
+                </div>
+              </div>
+            )}
 
             {/* Upgrade CTA */}
             {data.license_status === "Trial" && (

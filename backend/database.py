@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from dotenv import load_dotenv
@@ -34,6 +34,7 @@ class Company(Base):
 
     devices = relationship("Device", back_populates="company")
     queries = relationship("Query", back_populates="company")
+    employees = relationship("Employee", back_populates="company")
 
 
 class Device(Base):
@@ -46,9 +47,23 @@ class Device(Base):
     last_seen = Column(DateTime, default=datetime.utcnow)
     queries_processed = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
+    operator_role = Column(String, default="engineer")
 
     company = relationship("Company", back_populates="devices")
     queries = relationship("Query", back_populates="device")
+
+
+class Employee(Base):
+    __tablename__ = "employees"
+
+    id = Column(Integer, primary_key=True)
+    company_id = Column(Integer, ForeignKey("companies.id"))
+    email = Column(String, nullable=False)
+    role = Column(String, default="engineer")
+    device_id = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    company = relationship("Company", back_populates="employees")
 
 
 class Query(Base):
@@ -59,6 +74,8 @@ class Query(Base):
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     prompt_hash = Column(String, nullable=False)
     latency_ms = Column(Integer, nullable=False)
+    user_role = Column(String, nullable=True)
+    namespace = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     company = relationship("Company", back_populates="queries")

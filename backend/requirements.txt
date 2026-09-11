@@ -7,3 +7,4 @@ stripe
 python-multipart
 pydantic[email]
 python-dotenv
+cryptography
