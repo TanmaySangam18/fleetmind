@@ -12,8 +12,9 @@ from typing import Optional
 
 import stripe
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Request, Header
+from fastapi import FastAPI, Depends, HTTPException, Request, Header, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,8 @@ from power import power_score, is_power_eligible, get_reserve_pool, sort_by_powe
 from thermal import thermal_score, is_thermally_eligible, fleet_thermal_health, check_thermal_alerts
 from storage import store_file, retrieve_file, delete_file, fleet_storage_stats
 from security_monitor import record_query, check_anomaly, check_attestation_alerts, check_offline_alerts
+from ws_control import manager as ws_manager
+from audit import audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +354,7 @@ def device_heartbeat(body: HeartbeatRequest, db: Session = Depends(get_db)):
             device_id=body.device_id,
             device_model=body.device_model,
             queries_processed=body.queries_processed,
+            last_seen=datetime.utcnow(),
             is_active=True,
             operator_role=operator_role,
             device_ip=body.device_ip,
@@ -519,8 +523,17 @@ def mesh_query(body: MeshQueryRequest, db: Session = Depends(get_db)):
     db.add(q)
     db.commit()
 
-    # Record query for anomaly detection (Fire Suppression)
     record_query(target_device.device_id)
+    audit_log.record(
+        event_type="query",
+        company_id=company.id,
+        device_id=target_device.device_id,
+        user_role="engineer",
+        namespace="technical",
+        prompt_hash=prompt_hash,
+        latency_ms=latency_ms,
+        hardware_attested=bool(target_device.hardware_attested),
+    )
 
     return {
         "response": mock_response,
@@ -1571,4 +1584,154 @@ async def sharding_status(license_key: str, db: Session = Depends(get_db)):
         "active_devices": len(active),
         "devices": fleet_status,
         "model_feasibility": feasibility,
+    }
+
+
+# ===== WEBSOCKET CONTROL PLANE (replaces NSD/mDNS — works on enterprise WiFi) =====
+
+@app.websocket("/ws/device/{device_id}")
+async def device_ws_endpoint(websocket: WebSocket, device_id: str, license_key: str = ""):
+    """
+    Server-mediated device control plane.
+    Replaces NSD/mDNS peer discovery which fails on VLAN-segmented enterprise WiFi.
+    Devices connect here over HTTPS WebSocket — no multicast, no client-isolation issues.
+    """
+    metadata = {
+        "device_id": device_id,
+        "license_key": license_key,
+        "remote_addr": websocket.client.host if websocket.client else "unknown",
+    }
+    await ws_manager.connect(device_id, websocket, metadata)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+
+            if msg_type == "ping":
+                ws_manager.record_ping(device_id)
+                await websocket.send_json({"type": "pong", "server_time": datetime.utcnow().isoformat()})
+
+            elif msg_type == "telemetry":
+                # Device pushing real-time telemetry between heartbeats
+                thermal = data.get("thermal_state", "NONE")
+                if thermal in ("SEVERE", "CRITICAL"):
+                    await ws_manager.push_model_downscale(
+                        device_id,
+                        from_model=data.get("current_model", "llama3.2-3b"),
+                        to_model="llama3.2-1b",
+                        reason=f"Thermal state {thermal} — downscaling to reduce heat",
+                    )
+
+            elif msg_type == "query_complete":
+                pass  # Acknowledge — could update DB here for real-time stats
+
+    except WebSocketDisconnect:
+        ws_manager.disconnect(device_id)
+
+
+@app.get("/api/fleet/control-plane")
+def control_plane_status(license_key: str, db: Session = Depends(get_db)):
+    """WebSocket control plane registry — shows which devices are connected."""
+    _resolve_company_by_license(db, license_key)
+    return {
+        "connected_via_websocket": ws_manager.active_count(),
+        "device_ids": ws_manager.get_connected_ids(),
+        "note": "Server-mediated discovery — enterprise WiFi safe (no NSD/mDNS)",
+    }
+
+
+# ===== COMPLIANCE AUDIT TRAIL (HIPAA / SOC 2 Type II) =====
+
+@app.get("/api/audit/log")
+def get_audit_log(
+    license_key: str,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """Return paginated audit entries for HIPAA/SOC 2 review."""
+    company = _resolve_company_by_license(db, license_key)
+    entries = audit_log.get_entries(company_id=company.id, limit=limit, offset=offset)
+    return {"entries": entries, "limit": limit, "offset": offset}
+
+
+@app.get("/api/audit/verify")
+def verify_audit_chain(license_key: str, db: Session = Depends(get_db)):
+    """Verify tamper-evident hash chain integrity. Returns SOC 2 attestation."""
+    company = _resolve_company_by_license(db, license_key)
+    result = audit_log.verify_chain(company_id=company.id)
+    return {
+        **result,
+        "company_id": company.id,
+        "verified_at": datetime.utcnow().isoformat(),
+        "standard": "SOC 2 Type II / HIPAA audit trail",
+    }
+
+
+@app.get("/api/audit/export")
+def export_audit_csv(license_key: str, db: Session = Depends(get_db)):
+    """Export audit log as signed CSV for regulatory submission."""
+    company = _resolve_company_by_license(db, license_key)
+    csv_content = audit_log.export_csv(company_id=company.id)
+    return FastAPIResponse(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="fleetmind_audit_{company.id}.csv"'},
+    )
+
+
+@app.get("/api/audit/stats")
+def audit_stats(license_key: str, db: Session = Depends(get_db)):
+    """Audit log statistics — role distribution, attestation rate, chain integrity."""
+    company = _resolve_company_by_license(db, license_key)
+    return audit_log.stats(company_id=company.id)
+
+
+# ===== ADAPTIVE THERMAL ROUTER =====
+
+THERMAL_MODEL_LADDER = [
+    ("NONE",     "llama3.2-3b"),
+    ("LIGHT",    "llama3.2-3b"),
+    ("MODERATE", "llama3.2-1b"),
+    ("SEVERE",   "phi-4-mini"),
+    ("CRITICAL", None),  # excluded entirely
+]
+_THERMAL_MODEL_MAP = dict(THERMAL_MODEL_LADDER)
+
+
+@app.get("/api/fleet/adaptive-routing")
+def adaptive_routing_status(license_key: str, db: Session = Depends(get_db)):
+    """
+    Returns the recommended model tier per thermal zone across the fleet.
+    Coordinator uses this to assign inference tasks to thermally appropriate devices.
+    """
+    company = _resolve_company_by_license(db, license_key)
+    cutoff = datetime.utcnow() - timedelta(seconds=90)
+    active = db.query(Device).filter(
+        Device.company_id == company.id,
+        Device.last_seen >= cutoff,
+    ).all()
+
+    zones: dict[str, list[str]] = {model: [] for _, model in THERMAL_MODEL_LADDER if model}
+    excluded = []
+
+    for d in active:
+        state = d.thermal_state or "NONE"
+        model = _THERMAL_MODEL_MAP.get(state)
+        if model is None:
+            excluded.append(d.device_id)
+        else:
+            zones[model].append(d.device_id)
+
+    return {
+        "routing_zones": {model: {"device_count": len(ids), "device_ids": ids[:10]} for model, ids in zones.items()},
+        "thermally_excluded": len(excluded),
+        "excluded_device_ids": excluded[:10],
+        "total_active": len(active),
+        "recommendation": (
+            "llama3.2-3b" if zones.get("llama3.2-3b") else
+            "llama3.2-1b" if zones.get("llama3.2-1b") else
+            "phi-4-mini" if zones.get("phi-4-mini") else
+            "fleet_overloaded"
+        ),
     }
